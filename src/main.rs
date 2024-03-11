@@ -5,6 +5,7 @@ use std::{
     net::SocketAddr,
     str::from_utf8,
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use tokio::{
@@ -30,6 +31,14 @@ impl RedisCommands {
         }
     }
 }
+type Storage = Arc<Mutex<HashMap<String, RedisEntry>>>;
+
+#[derive(Debug)]
+struct RedisEntry {
+    val: String,
+    ttl: Option<u32>,
+    created_at: SystemTime,
+}
 
 #[tokio::main]
 async fn main() {
@@ -38,8 +47,7 @@ async fn main() {
 
     let listener = TcpListener::bind(socket_addr).await.unwrap();
 
-    let storage: Arc<Mutex<HashMap<String, String>>> =
-        Arc::new(Mutex::new(HashMap::<String, String>::new()));
+    let storage: Storage = Arc::new(Mutex::new(HashMap::<String, RedisEntry>::new()));
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             let storage = Arc::clone(&storage);
@@ -81,14 +89,25 @@ fn parse_redis_command<'a>(
     }
 }
 
-fn write_to_storage(storage: Arc<Mutex<HashMap<String, String>>>, val: (String, String)) {
+fn write_to_storage(storage: Storage, val: (String, String, Option<u32>)) {
     let mut storage = storage.lock().unwrap();
-    let (k, v) = val;
-    storage.insert(k, v);
+    let (k, val, ttl) = val;
+    let entry = RedisEntry {
+        val,
+        ttl,
+        created_at: SystemTime::now(),
+    };
+    storage.insert(k, entry);
 }
-fn read_from_storage(storage: Arc<Mutex<HashMap<String, String>>>, key: String) -> String {
+fn read_from_storage(storage: Storage, key: String) -> Option<String> {
     let storage = storage.lock().unwrap();
-    storage.get(&key).unwrap().to_string()
+    let entry = storage.get(&key).unwrap();
+    if let Some(ttl) = entry.ttl {
+        if entry.created_at.elapsed().unwrap().as_millis() > ttl.into() {
+            return None;
+        }
+    }
+    Some(entry.val.to_string())
 }
 
 async fn handle_ping_command(stream: &mut TcpStream) -> Result<(), Infallible> {
@@ -113,13 +132,24 @@ async fn handle_echo_command(stream: &mut TcpStream, args: Vec<&str>) -> Result<
 async fn handle_set_command(
     stream: &mut TcpStream,
     args: Vec<&str>,
-    storage: Arc<Mutex<HashMap<String, String>>>,
-) -> Result<(), Infallible> {
-    let mut args = args.iter();
-    let key = args.next().unwrap();
-    let val = args.next().unwrap();
+    storage: Storage,
+) -> Result<(), Error> {
+    let mut args_iter = args.iter();
+    let key = args_iter.next().unwrap();
+    let val = args_iter.next().unwrap();
+    let mut ttl: Option<u32> = None;
 
-    write_to_storage(storage, (key.to_string(), val.to_string()));
+    if args.len() > 2 {
+        let ttl_label = args_iter.next().unwrap();
+        if ttl_label != &"px" {
+            return Err(Error);
+        }
+
+        let ttl_agr = args_iter.next().unwrap().parse::<u32>().unwrap();
+        ttl = Some(ttl_agr);
+    }
+
+    write_to_storage(storage, (key.to_string(), val.to_string(), ttl));
 
     stream.write_all(b"+OK\r\n").await.unwrap();
     Ok(())
@@ -128,22 +158,26 @@ async fn handle_set_command(
 async fn handle_get_command(
     stream: &mut TcpStream,
     args: Vec<&str>,
-    storage: Arc<Mutex<HashMap<String, String>>>,
+    storage: Storage,
 ) -> Result<(), Error> {
     if args.len() != 1 {
         return Err(Error);
     }
 
     let key = args.iter().next().unwrap();
-    let msg = read_from_storage(storage, key.to_string());
-    let msg_len = msg.len();
-    let res = format!("${msg_len}\r\n{msg}\r\n");
-
-    stream.write_all(res.as_bytes()).await.unwrap();
-    Ok(())
+    if let Some(msg) = read_from_storage(storage, key.to_string()) {
+        println!("caiu 2");
+        let msg_len = msg.len();
+        let res = format!("${msg_len}\r\n{msg}\r\n");
+        stream.write_all(res.as_bytes()).await.unwrap();
+        Ok(())
+    } else {
+        stream.write_all(b"$-1\r\n").await.unwrap();
+        Ok(())
+    }
 }
 
-async fn handle_client(stream: &mut TcpStream, storage: Arc<Mutex<HashMap<String, String>>>) {
+async fn handle_client(stream: &mut TcpStream, storage: Storage) {
     let mut buf = [0; 1024];
     let range = stream.read(&mut buf).await.unwrap();
     let cmd = from_utf8(&buf[0..range]).unwrap();
