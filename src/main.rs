@@ -1,15 +1,21 @@
+use std::net::SocketAddr;
+
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let addr = "127.0.0.1:6379";
+    let socket_addr = addr.parse::<SocketAddr>().unwrap();
 
-    match listener.accept().await {
-        Ok(_socket) => {
-            println!("Accepted new connection!");
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
+    let listener = TcpListener::bind(socket_addr).await.unwrap();
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                println!("Accepted new connection!, Stream: {:?}", stream);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
         }
     }
 }
