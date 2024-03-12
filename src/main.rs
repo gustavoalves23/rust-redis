@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{vec_deque::VecDeque, HashMap},
     convert::Infallible,
+    env,
     fmt::Error,
     net::SocketAddr,
     str::from_utf8,
@@ -19,6 +20,7 @@ enum RedisCommands {
     Echo,
     Set,
     Get,
+    Config,
 }
 
 impl RedisCommands {
@@ -28,6 +30,7 @@ impl RedisCommands {
             RedisCommands::Echo => "ECHO",
             RedisCommands::Set => "SET",
             RedisCommands::Get => "GET",
+            RedisCommands::Config => "CONFIG",
         }
     }
 }
@@ -38,6 +41,25 @@ struct RedisEntry {
     val: String,
     ttl: Option<u32>,
     created_at: SystemTime,
+}
+
+type ProgramArgs = HashMap<String, String>;
+
+fn get_args() -> ProgramArgs {
+    let mut args = HashMap::<String, String>::new();
+    let mut args_vec: VecDeque<String> = env::args().collect();
+    VecDeque::pop_front(&mut args_vec).unwrap();
+
+    if args_vec.len() % 2 != 0 {
+        panic!()
+    }
+    for (index, key) in args_vec.iter().enumerate().step_by(2) {
+        let val = &args_vec[index + 1];
+        let (_, key) = key.split_at(2);
+        args.insert(key.to_string(), val.to_string());
+    }
+
+    args
 }
 
 #[tokio::main]
@@ -58,9 +80,23 @@ async fn main() {
                 }
             });
         } else {
-            panic!()
+            unimplemented!()
         }
     }
+}
+fn bulk_response(cmd: Vec<&str>) -> String {
+    let new_line = "\r\n";
+    let mut res = String::from("*");
+    let qty = cmd.len().to_string();
+    res.push_str(&qty);
+    res.push_str(&new_line);
+    cmd.iter().for_each(|str| {
+        res.push_str(&format!("${}", str.len()));
+        res.push_str(&new_line);
+        res.push_str(&str);
+        res.push_str(&new_line);
+    });
+    res
 }
 
 fn parse_redis_command<'a>(
@@ -77,7 +113,11 @@ fn parse_redis_command<'a>(
                 cmd if cmd == RedisCommands::Echo.as_command() => RedisCommands::Echo,
                 cmd if cmd == RedisCommands::Set.as_command() => RedisCommands::Set,
                 cmd if cmd == RedisCommands::Get.as_command() => RedisCommands::Get,
-                _cmd => panic!(),
+                cmd if cmd == RedisCommands::Config.as_command() => RedisCommands::Config,
+                cmd => {
+                    println!("Uninplemented command: {cmd}");
+                    panic!()
+                }
             };
             let args: Vec<_> = command_arr
                 .filter(|x| x != &"" && !x.contains("$"))
@@ -113,6 +153,24 @@ fn read_from_storage(storage: Storage, key: String) -> Option<String> {
 async fn handle_ping_command(stream: &mut TcpStream) -> Result<(), Infallible> {
     const PING_RESPONSE: [u8; 7] = *b"+PONG\r\n";
     stream.write_all(&PING_RESPONSE).await.unwrap();
+    Ok(())
+}
+
+async fn handle_config_command(stream: &mut TcpStream, args: Vec<&str>) -> Result<(), Error> {
+    if args.len() != 2
+        || args[0].to_uppercase() != "GET"
+        || ["--dir", "--dbfilename"].iter().any(|el| &args[1] == el)
+    {
+        dbg!("Invalid args");
+        return Err(Error);
+    }
+    let requested_arg = args[1];
+    let args = get_args();
+    if let Some(arg_val) = args.get(requested_arg) {
+        let cmd = [requested_arg, arg_val];
+        let res = bulk_response(cmd.into());
+        stream.write_all(res.as_bytes()).await.unwrap();
+    };
     Ok(())
 }
 
@@ -194,6 +252,9 @@ async fn handle_client(stream: &mut TcpStream, storage: Storage) {
             }
             (RedisCommands::Get, args, _) => {
                 handle_get_command(stream, args, storage).await.unwrap();
+            }
+            (RedisCommands::Config, args, _) => {
+                handle_config_command(stream, args).await.unwrap();
             }
         }
     }
